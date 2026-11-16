@@ -37,6 +37,8 @@ const COMPLEXITY_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
 const TYPE_ORDER: ModuleType[] = [
   "function",
   "class",
+  "interface",
+  "enum",
   "component",
   "hook",
   "service",
