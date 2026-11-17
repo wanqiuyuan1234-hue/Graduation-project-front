@@ -9,34 +9,52 @@ import {
   Clock,
   Copy,
   Github,
+  Loader2,
+  Lock,
   MessageSquareText,
   Pencil,
   Play,
+  Plus,
   RefreshCw,
   SendHorizontal,
   Sparkles,
   Square,
-  Trash2,
-  X,
+  TriangleAlert,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  CHAT_SUGGESTIONS,
-  SOURCE_CHUNKS,
-  getModuleById,
-  getRepoById,
-} from "@/lib/rag/mock-data";
+import { CHAT_SUGGESTIONS } from "@/lib/rag/mock-data";
 import type {
   ChatMessage,
   Citation,
+  Language,
   RetrievalDebug,
-  RetrievalResult,
   SourceChunk,
 } from "@/lib/rag/types";
 import { useNavStore } from "@/lib/rag/store";
+import { useRepos } from "@/lib/api/hooks";
+import {
+  apiChatConfig,
+  apiDeleteChatSession,
+  apiGetChatSession,
+  apiRenameChatSession,
+  formatServerTime,
+  loadChatSessions,
+  streamChat,
+  useChatSessions,
+  type ApiChatMessage,
+  type ApiRetrievalDebug,
+  type ApiSource,
+} from "@/lib/api/chat";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { toast } from "sonner";
 import {
   Collapsible,
@@ -61,6 +79,17 @@ type ContentPart =
   | { type: "text"; value: string }
   | { type: "cite"; index: number };
 
+const LANGUAGE_SET = new Set<string>([
+  "typescript",
+  "tsx",
+  "javascript",
+  "jsx",
+  "python",
+  "go",
+  "rust",
+  "java",
+]);
+
 function parseCitations(content: string): ContentPart[] {
   const parts: ContentPart[] = [];
   const regex = /\[(\d+)\]/g;
@@ -83,7 +112,6 @@ function parseCitations(content: string): ContentPart[] {
  * Format a chat message timestamp ("YYYY-MM-DD HH:mm:ss") into a short label
  * for display in the message header. Returns "HH:mm" when the message was
  * sent today, otherwise "MM-DD HH:mm" so cross-day messages stay oriented.
- * Pure / deterministic — safe to call at render time.
  */
 function formatTimestamp(ts: string): string {
   if (!ts || ts.length < 16) return ts ?? "";
@@ -93,55 +121,64 @@ function formatTimestamp(ts: string): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   if (msgDate === today) return time;
-  // Different day → prefix with MM-DD so the user can tell at a glance.
   return `${ts.slice(5, 7)}-${ts.slice(8, 10)} ${time}`;
 }
 
-/**
- * Build mock citations + RetrievalDebug for a user message. Shared by the mock
- * fallback (`generateReply`) and the real-LLM success path (`fetchReply`) so
- * both replies show the same citation / retrieval UX — only the assistant
- * `content` differs (real LLM text vs. mock text). Returns the picked chunks
- * too so `generateReply` can reference their filePath in its mock content.
- *
- * Pure / deterministic except for the random `latencyMs` — safe to call at
- * render-time-adjacent points.
- */
-function buildMockRetrievalContext(userText: string): {
-  picks: SourceChunk[];
-  citations: Citation[];
-  retrieval: RetrievalDebug;
-} {
-  const picks = [SOURCE_CHUNKS[0], SOURCE_CHUNKS[1], SOURCE_CHUNKS[2]];
-  const citations: Citation[] = picks.map((chunk, i) => ({
-    index: i + 1,
-    chunk,
-  }));
-  const retrieval: RetrievalDebug = {
-    query: userText,
-    topK: 6,
-    reranked: true,
-    rerankModel: "bge-reranker-v2-m3",
-    latencyMs: 240 + Math.floor(Math.random() * 220),
-    vectorWeight: 0.7,
-    keywordWeight: 0.3,
-    results: picks.map((chunk) => ({
-      chunk,
-      score: chunk.score,
-      rerankedScore: chunk.rerankedScore ?? chunk.score,
-    })),
+/** 后端 SourceOut → 前端 SourceChunk（引用角标、来源面板都读这个结构）。 */
+function toSourceChunk(source: ApiSource): SourceChunk {
+  return {
+    id: String(source.chunk_id),
+    chunkId: String(source.chunk_id),
+    moduleId: source.module_id === null ? "" : String(source.module_id),
+    repoId: String(source.repo_id),
+    repoName: source.repo_name,
+    fileId: String(source.file_id),
+    filePath: source.file_path,
+    language: (LANGUAGE_SET.has(source.language ?? "")
+      ? source.language
+      : "unknown") as Language,
+    startLine: source.start_line,
+    endLine: source.end_line,
+    content: source.content,
+    chunkType: source.chunk_type as SourceChunk["chunkType"],
+    tokenCount: Math.max(1, Math.round(source.content.length / 3.2)),
+    score: source.score,
   };
-  return { picks, citations, retrieval };
 }
 
-/**
- * Rough token estimate for an LLM reply string. The real SDK doesn't return a
- * usage field we currently surface, so we approximate at ~3 chars/token (a
- * common rule of thumb for mixed CJK + latin text). Clamped to a 40-token
- * floor so very short replies don't render as "12 tokens" which looks broken.
- */
-function estimateTokens(content: string): number {
-  return Math.max(40, Math.round(content.length / 3));
+function toRetrievalDebug(
+  sources: ApiSource[],
+  debug: ApiRetrievalDebug,
+  query: string,
+): RetrievalDebug {
+  return {
+    query,
+    topK: sources.length,
+    // 本期不做重排，展示分即融合后的检索分
+    reranked: false,
+    rerankModel: "",
+    latencyMs: debug.took_ms,
+    vectorWeight: 0.7,
+    keywordWeight: 0.3,
+    results: sources.map((source) => ({
+      chunk: toSourceChunk(source),
+      score: source.score,
+      rerankedScore: source.score,
+    })),
+  };
+}
+
+function toChatMessage(message: ApiChatMessage): ChatMessage {
+  return {
+    id: String(message.id),
+    role: message.role,
+    content: message.content,
+    citations: message.citations?.map((source) => ({
+      index: source.index,
+      chunk: toSourceChunk(source),
+    })),
+    timestamp: formatServerTime(message.created_at),
+  };
 }
 
 function MessageContent({
@@ -176,821 +213,346 @@ function MessageContent({
   );
 }
 
-/**
- * Stream-speed presets. `streamSpeed` (1-5, persisted in the nav store) maps
- * to a per-tick interval range (ms) + a per-tick token batch range. Faster
- * speeds use shorter intervals AND larger batches so the typewriter effect
- * stays smooth (a 8ms tick emitting 1 token would re-render 125×/s and peg
- * the main thread on ReactMarkdown re-parses; emitting 2-4 tokens per 8-16ms
- * tick halves the parse cost while still feeling "instant").
- *
- * Batches use inclusive ranges; a tick draws `batchMin + rand(batchMax-batchMin+1)`
- * tokens. The interval is also randomized once at stream start so two parallel
- * streams don't visually sync.
- *
- * Mid-stream speed changes do NOT re-pace an in-flight stream — the interval
- * is captured once at start. The next streamReply invocation picks up the new
- * speed because `streamSpeed` is in streamReply's useCallback deps.
- */
-const SPEED_CONFIG: Record<
-  number,
-  { intervalMin: number; intervalMax: number; batchMin: number; batchMax: number }
-> = {
-  1: { intervalMin: 90, intervalMax: 130, batchMin: 1, batchMax: 1 }, // 极慢
-  2: { intervalMin: 60, intervalMax: 90, batchMin: 1, batchMax: 1 }, // 慢
-  3: { intervalMin: 28, intervalMax: 52, batchMin: 1, batchMax: 3 }, // 标准 (default)
-  4: { intervalMin: 16, intervalMax: 30, batchMin: 2, batchMax: 3 }, // 快
-  5: { intervalMin: 8, intervalMax: 16, batchMin: 2, batchMax: 4 }, // 极快
-};
-
-/**
- * Find the token boundary idx such that `tokens.slice(0, idx).join("")`
- * corresponds to the already-streamed `partial` content. Used by handleResume
- * to compute the remaining token slice to re-stream after a stop.
- *
- * `partial` is always the result of `tokens.slice(0, idx).join("")` for some
- * idx (set by streamReply's throttled flush), so this returns that exact idx.
- * If `partial` ends mid-token (defensive — shouldn't happen with the current
- * flush logic), we return the boundary <= partial.length so the remaining
- * stream re-emits the partial-token fragment; the terminal completion write
- * always overwrites with the exact full content, so no duplication persists.
- */
-function findResumeTokenIdx(tokens: string[], partial: string): number {
-  let acc = 0;
-  for (let i = 0; i < tokens.length; i++) {
-    if (acc + tokens[i].length > partial.length) return i;
-    acc += tokens[i].length;
-  }
-  return tokens.length;
-}
-
 export function ChatPage() {
-  const sessions = useNavStore((s) => s.sessions);
+  const { sessions, loading: sessionsLoading } = useChatSessions();
   const activeSessionId = useNavStore((s) => s.activeSessionId);
+  const setActiveSession = useNavStore((s) => s.setActiveSession);
+  const openModule = useNavStore((s) => s.openModule);
   const sourcePanelOpen = useNavStore((s) => s.sourcePanelOpen);
   const activeCitationIndex = useNavStore((s) => s.activeCitationIndex);
-  const streamSpeed = useNavStore((s) => s.streamSpeed);
   const setCitation = useNavStore((s) => s.setCitation);
   const setSourcePanelOpen = useNavStore((s) => s.setSourcePanelOpen);
-  const createSession = useNavStore((s) => s.createSession);
-  const setSessionMessages = useNavStore((s) => s.setSessionMessages);
-  const replaceMessage = useNavStore((s) => s.replaceMessage);
-  const updateMessage = useNavStore((s) => s.updateMessage);
+  const rewriteMode = useNavStore((s) => s.rewriteMode);
+  const { repos } = useRepos();
 
-  const baseSession = useMemo(
-    () => sessions.find((s) => s.id === activeSessionId) ?? sessions[0],
-    [sessions, activeSessionId],
-  );
-  const repo = baseSession ? getRepoById(baseSession.repoId) : undefined;
-
-  // Per-session message map: when a session is first viewed, seed from
-  // baseSession.messages (which themselves are persisted in the store, so
-  // refresh-safe). Switching sessions recomputes currentMessages at render
-  // time (no effect). Writes go through setMessages which ALSO syncs to the
-  // store via setSessionMessages, so new messages persist across refresh.
-  const [messagesBySession, setMessagesBySession] = useState<
-    Record<string, ChatMessage[]>
-  >({});
-  const currentMessages =
-    (baseSession && messagesBySession[baseSession.id]) ??
-    baseSession?.messages ??
-    [];
-
-  const setMessages = useCallback(
-    (next: ChatMessage[] | ((p: ChatMessage[]) => ChatMessage[])) => {
-      if (!baseSession) return;
-      setMessagesBySession((prev) => {
-        const base = prev[baseSession.id] ?? baseSession.messages;
-        const val =
-          typeof next === "function"
-            ? (next as (p: ChatMessage[]) => ChatMessage[])(base)
-            : next;
-        // Persist the new message array into the store session so it survives
-        // refresh (zustand persist handles localStorage). Fire-and-forget;
-        // the local map remains the source of truth for the current render.
-        setSessionMessages(baseSession.id, val);
-        return { ...prev, [baseSession.id]: val };
-      });
-    },
-    [baseSession, setSessionMessages],
-  );
-
+  const [draftRepoId, setDraftRepoId] = useState("all");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messagesLoading, setMessagesLoading] = useState(false);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(
     null,
   );
-  const [stoppedMessages, setStoppedMessages] = useState<Set<string>>(new Set());
-  const [editingId, setEditingId] = useState<string | null>(null);
   const [showDebug, setShowDebug] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // AbortController for the in-flight /api/chat fetch (if any). Set when
-  // handleSend / handleRetry / handleEditSave kicks off fetchReply, cleared
-  // when the fetch resolves or when handleStop aborts it. The unmount effect
-  // also aborts any pending fetch so a delayed LLM response doesn't land
-  // after the user navigates away.
+  const [llmConfigured, setLlmConfigured] = useState<boolean | null>(null);
+
   const abortRef = useRef<AbortController | null>(null);
-  // Map of draft message id → the FULL pre-computed ChatMessage (content +
-  // citations + retrieval + tokens) that streamReply is streaming toward.
-  // Populated on streamReply start, deleted on streamReply completion. NOT
-  // deleted on handleStop — so handleResume can read the full reply and
-  // re-stream the remaining tokens from where the partial content left off.
-  // Storing the full ChatMessage (not just content) lets resume completion
-  // restore the citations / retrieval / tokens that the original stream
-  // never got to flush (since the draft carries empty citations/retrieval
-  // until the terminal completion write).
-  const fullReplyByDraftId = useRef<Map<string, ChatMessage>>(new Map());
+  const skipLoadRef = useRef<string | null>(null);
+  const validatedRef = useRef(false);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-  const messages = currentMessages;
-
-  const lastAssistant = useMemo(
-    () => [...messages].reverse().find((m) => m.role === "assistant"),
-    [messages],
+  const activeSession = useMemo(
+    () => sessions.find((session) => session.id === activeSessionId),
+    [sessions, activeSessionId],
   );
-  const activeCitations = lastAssistant?.citations ?? [];
+  const isNewSession = !activeSession;
+
+  const repoLabel = activeSession
+    ? activeSession.repoName ?? "所有仓库"
+    : draftRepoId === "all"
+      ? "所有仓库"
+      : repos.find((repo) => repo.id === draftRepoId)?.name ?? "指定仓库";
+
+  const lastAssistant = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") return messages[i];
+    }
+    return null;
+  }, [messages]);
+
+  const activeCitations = useMemo(
+    () => lastAssistant?.citations ?? [],
+    [lastAssistant],
+  );
+
+  // 读取后端 LLM 配置状态：未配置时在对话顶部明确提示，避免用户误以为在调用模型
+  useEffect(() => {
+    let cancelled = false;
+    apiChatConfig()
+      .then((config) => {
+        if (!cancelled) setLlmConfigured(config.llm_configured);
+      })
+      .catch(() => {
+        if (!cancelled) setLlmConfigured(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 第一次拿到服务端会话列表时校正本地持久化的 activeSessionId：
+  // 旧版本 localStorage 里可能是 mock 的 `sess-1`，服务端不存在。
+  useEffect(() => {
+    if (validatedRef.current || sessions.length === 0) return;
+    validatedRef.current = true;
+    const current = useNavStore.getState().activeSessionId;
+    if (!current || !sessions.some((session) => session.id === current)) {
+      setActiveSession(sessions[0].id);
+    }
+  }, [sessions, setActiveSession]);
+
+  // 切换会话时加载历史消息；刚由 SSE 创建的会话跳过（本地已有完整消息）。
+  useEffect(() => {
+    if (!activeSessionId) {
+      setMessages([]);
+      return;
+    }
+    if (skipLoadRef.current === activeSessionId) {
+      skipLoadRef.current = null;
+      return;
+    }
+    const numericId = Number(activeSessionId);
+    if (!Number.isFinite(numericId)) return;
+
+    let cancelled = false;
+    setMessagesLoading(true);
+    apiGetChatSession(numericId)
+      .then((detail) => {
+        if (!cancelled) setMessages(detail.messages.map(toChatMessage));
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          toast.error(error instanceof Error ? error.message : "加载会话失败");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setMessagesLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, streaming]);
+    messagesEndRef.current?.scrollIntoView({ block: "end" });
+  }, [messages, streamingMessageId]);
 
-  // Update a message's content IN THE LOCAL MAP ONLY (no store/persist write).
-  // Used for high-frequency token streaming to avoid localStorage thrash.
-  // The final complete message is persisted via setMessages on stream completion.
-  const updateMessageLocal = useCallback(
-    (messageId: string, patch: Partial<ChatMessage>) => {
-      if (!baseSession) return;
-      setMessagesBySession((prev) => {
-        const base = prev[baseSession.id] ?? baseSession.messages;
-        const next = base.map((m) =>
-          m.id === messageId ? { ...m, ...patch } : m,
-        );
-        return { ...prev, [baseSession.id]: next };
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const handleCreateSession = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setActiveSession(null);
+    setMessages([]);
+    setDraftRepoId("all");
+    setInput("");
+    setMobileOpen(false);
+  }, [setActiveSession]);
+
+  const handleSelectSession = useCallback(
+    (id: string) => {
+      if (id === activeSessionId) {
+        setMobileOpen(false);
+        return;
+      }
+      abortRef.current?.abort();
+      setActiveSession(id);
+      setMobileOpen(false);
+    },
+    [activeSessionId, setActiveSession],
+  );
+
+  const handleDeleteSession = useCallback(
+    async (id: string) => {
+      try {
+        await apiDeleteChatSession(Number(id));
+        const remaining = sessions.filter((session) => session.id !== id);
+        if (activeSessionId === id) {
+          setActiveSession(remaining[0]?.id ?? null);
+        }
+        await loadChatSessions(true);
+        toast.success("已删除会话");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "删除会话失败");
+      }
+    },
+    [activeSessionId, sessions, setActiveSession],
+  );
+
+  const handleRenameSession = useCallback(async (id: string, title: string) => {
+    try {
+      await apiRenameChatSession(Number(id), title);
+      await loadChatSessions(true);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重命名失败");
+    }
+  }, []);
+
+  const handleJumpToCode = useCallback(
+    (chunk: SourceChunk) => {
+      if (!chunk.moduleId) {
+        toast.error("该切片没有所属模块（fixed 基线切片无法跳转）");
+        return;
+      }
+      openModule(chunk.moduleId, {
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
       });
     },
-    [baseSession],
+    [openModule],
   );
 
-  // Clear any pending stream interval AND in-flight LLM fetch on unmount so a
-  // delayed reply doesn't land after the user navigates away. Cleanup-only
-  // effect — no setState in body, so react-hooks/set-state-in-effect is not
-  // triggered.
-  useEffect(() => {
-    return () => {
-      if (streamTimerRef.current) {
-        clearInterval(streamTimerRef.current);
-        streamTimerRef.current = null;
-      }
-      if (abortRef.current) {
-        abortRef.current.abort();
-        abortRef.current = null;
-      }
-    };
-  }, []);
-
-  // Brief skeleton (MessageSkeleton x2) when switching active session — 250ms.
-  // Flip loading → true via render-time comparison (sync setState in effect
-  // body would trip react-hooks/set-state-in-effect); the flip → false is
-  // scheduled inside a setTimeout callback (async, allowed).
-  const [messagesLoading, setMessagesLoading] = useState(false);
-  const [lastLoadedSession, setLastLoadedSession] = useState<string | null>(
-    activeSessionId,
-  );
-  if (activeSessionId !== lastLoadedSession) {
-    setLastLoadedSession(activeSessionId);
-    setMessagesLoading(true);
-  }
-  useEffect(() => {
-    if (!messagesLoading) return;
-    const timer = window.setTimeout(() => setMessagesLoading(false), 250);
-    return () => window.clearTimeout(timer);
-  }, [messagesLoading, activeSessionId]);
-
-  // Build a fresh mock assistant reply for the given user text. Used as the
-  // FALLBACK when /api/chat fails (SDK not configured, network error, etc.)
- // so the app stays functional even without a working LLM backend. Pure
-  // function, no side effects.
-  const generateReply = useCallback((userText: string): ChatMessage => {
-    const { picks, citations, retrieval } = buildMockRetrievalContext(userText);
-    return {
-      id: `a-${Date.now()}`,
-      role: "assistant",
-      content: `根据代码库检索，在 \`${picks[0]?.filePath}\` 等模块中找到 **${picks.length}** 处参考 [1]。\n\n### 关键链路\n- 向量召回 + 关键词融合，topK=${retrieval.topK} 候选 [1][2]\n- \`bge-reranker-v2-m3\` 交叉编码器重排保留最相关切片 [2][3]\n- 最终交由 LLM 编排生成回答 [3]\n\n> 模拟回答：实际链路需对接后端 retrieve / rerank / LLM 服务。`,
-      citations,
-      retrieval,
-      timestamp: new Date().toISOString().replace("T", " ").slice(0, 19),
-      tokens: 180 + Math.floor(Math.random() * 80),
-    };
-  }, []);
-
-  /**
-   * Call /api/chat (the real z-ai-web-dev-sdk LLM backend) and return a fully
-   * assembled ChatMessage whose `content` is the real LLM reply. Citations +
-   * retrieval are still mock (we don't have a real vector DB wired to the LLM
-   * yet) — they reuse buildMockRetrievalContext so the citation / debug UX is
-   * unchanged.
-   *
-   * `history` should be the conversation BEFORE the new user message — this
-   * function appends `{ role: "user", content: userText }` to it before
-   * sending, matching the request shape /api/chat expects.
-   *
-   * Returns null when the fetch was aborted (user clicked stop). On any other
-   * error (network / 500 / empty content), falls back to `generateReply` so
-   * the user always gets a reply bubble. A toast surfaces the fallback so the
-   * user knows the real LLM didn't respond.
-   */
-  const fetchReply = useCallback(
-    async (
-      userText: string,
-      history: ChatMessage[],
-      repoId: string | undefined,
-      signal: AbortSignal,
-    ): Promise<ChatMessage | null> => {
-      const now = new Date().toISOString().replace("T", " ").slice(0, 19);
-      const userMsg: ChatMessage = {
-        id: `u-${Date.now()}`,
-        role: "user",
-        content: userText,
-        timestamp: now,
-      };
-      try {
-        const res = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            messages: [...history, userMsg],
-            repoId,
-          }),
-          signal,
-        });
-        if (!res.ok) {
-          const errText = await res.text().catch(() => "");
-          throw new Error(
-            `HTTP ${res.status}${errText ? `: ${errText.slice(0, 200)}` : ""}`,
-          );
-        }
-        const data = (await res.json()) as { content?: string };
-        const content = (data?.content ?? "").trim();
-        if (!content) throw new Error("Empty content from /api/chat");
-        const { citations, retrieval } = buildMockRetrievalContext(userText);
-        return {
-          id: `a-${Date.now()}`,
-          role: "assistant",
-          content,
-          citations,
-          retrieval,
-          timestamp: now,
-          tokens: estimateTokens(content),
-        };
-      } catch (err) {
-        // User aborted (clicked stop) — return null so the caller short-
-        // circuits without streaming. We don't toast here because handleStop
-        // already toasts "已停止生成".
-        if (signal.aborted) return null;
-        console.warn("[CodeRAG] /api/chat failed, falling back to mock reply:", err);
-        toast.error("生成失败，使用模拟回复");
-        return generateReply(userText);
-      }
-    },
-    [generateReply],
-  );
-
-  // Split content into streaming "tokens" preserving whitespace, so the
-  // typewriter effect reveals word-by-word (including newlines for markdown).
-  function splitTokens(text: string): string[] {
-    return text.split(/(\s+)/);
-  }
-
-  // Stream a pre-built reply's content into the messages array token-by-token.
-  // Uses a local update (no store write) for each token; persists the final
-  // complete message via setMessages on completion. Returns the interval handle.
-  //
-  // opts.startIdx + opts.prefix support resume-after-stop: streamReply slices
-  // `tokens` from startIdx and prepends `prefix` (the already-streamed partial
-  // content) to every throttled partial flush, so the resumed stream visually
-  // appends to the existing partial instead of replacing it. The terminal
-  // completion write always sets `fullReply.content` exactly, so even if the
-  // prefix/startIdx arithmetic drifts by a fragment, the final rendered text
-  // is the full content with no duplication.
-  //
-  // SPEED: interval + batchSize are derived from `streamSpeed` (1-5) via
-  // SPEED_CONFIG. Faster speeds → shorter interval + larger batch. The
-  // interval is randomized once at stream start so concurrent streams don't
-  // visually sync. `streamSpeed` is in useCallback deps so a settings change
-  // takes effect on the next streamReply invocation (mid-stream re-pace would
-  // require clearing+resetting the interval, which we don't do — acceptable).
-  //
-  // THROTTLE: tokens accumulate in `emitted` across ticks, but updateMessageLocal
-  // only fires when ≥60ms have passed since the last flush (≈2 ticks at the
-  // 28-52ms pacing), or on completion. The first tick always flushes
-  // (lastFlushTime=0) so the first token appears immediately; subsequent
-  // ticks coalesce 2-3 tokens per flush, ~halving re-render frequency and
-  // the ReactMarkdown re-parse cost without a perceptible typing delay
-  // (60ms < human perception threshold for typing). The final completion
-  // flush is unconditional, so the user always sees the full content +
-  // citations even if the last partial flush was within the window.
-  const streamReply = useCallback(
-    (
-      draftId: string,
-      fullReply: ChatMessage,
-      opts?: { startIdx?: number; prefix?: string },
-    ) => {
-      const startIdx = opts?.startIdx ?? 0;
-      const prefix = opts?.prefix ?? "";
-      const allTokens = splitTokens(fullReply.content);
-      const tokens = allTokens.slice(startIdx);
-      let emitted = 0;
-      // Brief "thinking" delay before the first token lands.
-      let firstTokenFired = false;
-      // Throttle tracker: 0 → first tick always flushes (Date.now() - 0 ≫
-      // THROTTLE_MS), so the very first token lands immediately for perceived
-      // responsiveness. Subsequent partial flushes wait ≥60ms.
-      let lastFlushTime = 0;
-      const THROTTLE_MS = 60;
-      // Retain the full reply so handleResume can re-stream remaining tokens
-      // after a stop. Cleared on completion. On stop the entry stays — see
-      // handleStop / handleResume.
-      fullReplyByDraftId.current.set(draftId, fullReply);
-      const speed = SPEED_CONFIG[streamSpeed] ?? SPEED_CONFIG[3];
-      const intervalMs =
-        speed.intervalMin +
-        Math.floor(Math.random() * (speed.intervalMax - speed.intervalMin + 1));
-      const batchSpan = speed.batchMax - speed.batchMin + 1;
-      const interval = window.setInterval(
-        () => {
-          if (!firstTokenFired) {
-            firstTokenFired = true;
-          }
-          // Emit batchMin..batchMax tokens per tick. Faster speeds emit more
-          // tokens per tick (markdown splits give small whitespace tokens, so
-          // batching keeps pacing readable and amortizes ReactMarkdown cost).
-          const batchSize = speed.batchMin + Math.floor(Math.random() * batchSpan);
-          for (let b = 0; b < batchSize && emitted < tokens.length; b++) {
-            emitted++;
-          }
-          if (emitted >= tokens.length) {
-            // Streaming complete: ALWAYS flush the final full message (with
-            // citations + retrieval + tokens) to the local map AND persist to
-            // the store, even if the last partial flush was within the throttle
-            // window. This is the single guaranteed terminal write.
-            updateMessageLocal(draftId, {
-              content: fullReply.content,
-              citations: fullReply.citations,
-              retrieval: fullReply.retrieval,
-              tokens: fullReply.tokens,
-            });
-            setMessages((prev) => {
-              // setMessages persists to store via setSessionMessages — this is
-              // the single store write for the whole stream.
-              const next = prev.map((m) =>
-                m.id === draftId ? { ...m, ...fullReply, content: fullReply.content } : m,
-              );
-              return next;
-            });
-            fullReplyByDraftId.current.delete(draftId);
-            setStreaming(false);
-            setStreamingMessageId(null);
-            if (streamTimerRef.current) {
-              clearInterval(streamTimerRef.current);
-              streamTimerRef.current = null;
-            }
-            return;
-          }
-          // THROTTLE: tokens accumulate in `emitted` across ticks, but we only
-          // re-render when ≥60ms have passed since the last flush (≈2 ticks at
-          // the 28-52ms pacing). Date.now() - 0 is always ≥60 on the first
-          // tick so the very first token lands immediately (perceived
-          // responsiveness); subsequent ticks coalesce 2-3 tokens per flush,
-          // ~halving ReactMarkdown re-parse cost. The accumulated content
-          // lives in `prefix + tokens.slice(0, emitted).join("")` (emitted
-          // keeps advancing), so a delayed flush still shows every token
-          // received so far — no content is lost between flushes. Prefix is
-          // "" for fresh streams and the partial content for resumed streams.
-          const now = Date.now();
-          if (now - lastFlushTime >= THROTTLE_MS) {
-            const partialContent = prefix + tokens.slice(0, emitted).join("");
-            updateMessageLocal(draftId, { content: partialContent });
-            lastFlushTime = now;
-          }
-        },
-        intervalMs,
+  const patchMessage = useCallback(
+    (id: string, patch: Partial<ChatMessage>) => {
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === id ? { ...message, ...patch } : message,
+        ),
       );
-      streamTimerRef.current = interval;
     },
-    [updateMessageLocal, setMessages, streamSpeed],
+    [],
   );
 
-  /**
-   * Run fetchReply → streamReply for a draft that was already inserted into
-   * the messages array. Shared by handleSend / handleRetry / handleEditSave
-   * so all three paths share the same thinking-phase + abort + fallback
-   * behavior. `historyForFetch` is the conversation BEFORE the user message
-   * we're asking about (fetchReply appends the user message itself).
-   *
-   * Side effects: sets abortRef.current to a fresh AbortController for the
-   * duration of the fetch, then clears it (or it's cleared by handleStop on
-   * abort). On resolve, hands the reply to streamReply which begins the
-   * token-by-token typewriter. On abort, no-ops.
-   */
-  const runFetchThenStream = useCallback(
-    (
-      draftId: string,
-      userText: string,
-      historyForFetch: ChatMessage[],
-      repoId: string | undefined,
-      extraReplyFields?: Partial<ChatMessage>,
-    ) => {
-      const controller = new AbortController();
-      abortRef.current = controller;
-      void (async () => {
-        const reply = await fetchReply(
-          userText,
-          historyForFetch,
-          repoId,
-          controller.signal,
-        );
-        // User aborted (handleStop set abortRef.current = null) OR a new
-        // fetch was started (abortRef.current points to a different
-        // controller). Either way, don't start streaming.
-        if (!reply) return;
-        if (abortRef.current !== controller) return;
-        abortRef.current = null;
-        const finalReply: ChatMessage = {
-          ...reply,
-          id: draftId,
-          ...extraReplyFields,
-        };
-        streamReply(draftId, finalReply);
-      })();
-    },
-    [fetchReply, streamReply],
-  );
+  const appendToMessage = useCallback((id: string, text: string) => {
+    setMessages((prev) =>
+      prev.map((message) =>
+        message.id === id
+          ? { ...message, content: message.content + text }
+          : message,
+      ),
+    );
+  }, []);
 
   const handleSend = useCallback(
-    (text: string) => {
+    async (text: string) => {
       const trimmed = text.trim();
-      if (!trimmed || streaming || !baseSession) return;
-      const now = new Date().toISOString().replace("T", " ").slice(0, 19);
-      const userMsg: ChatMessage = {
+      if (!trimmed || streaming) return;
+
+      const stamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+      const draftId = `a-${Date.now()}`;
+      const userMessage: ChatMessage = {
         id: `u-${Date.now()}`,
         role: "user",
         content: trimmed,
-        timestamp: now,
+        timestamp: stamp,
       };
-      const draftId = `a-${Date.now()}`;
-      const draft: ChatMessage = {
+      const draftMessage: ChatMessage = {
         id: draftId,
         role: "assistant",
         content: "",
-        timestamp: now,
+        timestamp: stamp,
       };
-      // Capture history BEFORE the user message is added — fetchReply will
-      // append the user message itself when building the /api/chat request.
-      const historyForFetch = messages;
-      // Append user + empty draft, then start streaming. Use setMessages so
-      // both persist to the store (the draft's empty state is fine to persist).
-      setMessages((prev) => [...prev, userMsg, draft]);
+
+      // 发给后端的 history 不包含本次问题（后端会自己追加）
+      const history = messages.slice(-6).map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
+      const sessionIdForRequest = activeSessionId
+        ? Number(activeSessionId)
+        : null;
+      const repoIdsForRequest =
+        activeSessionId || draftRepoId === "all"
+          ? null
+          : [Number(draftRepoId)];
+
+      setMessages((prev) => [...prev, userMessage, draftMessage]);
       setInput("");
       setStreaming(true);
       setStreamingMessageId(draftId);
-      // Thinking phase: while fetchReply is pending, the empty draft bubble
-      // renders TypingDots (see MessageItem). The old 200ms thinkTimer is
-      // replaced by the actual fetch duration — when the LLM responds,
-      // streamReply takes over and the typewriter begins on real content.
-      runFetchThenStream(draftId, trimmed, historyForFetch, baseSession.repoId);
-    },
-    [baseSession, streaming, messages, setMessages, runFetchThenStream],
-  );
 
-  // Stop an in-flight stream OR a pending thinking-phase fetch: abort the
-  // /api/chat request (if still pending), clear the stream interval (if
-  // streaming has started), keep whatever partial content has landed, mark
-  // the message as stopped, and inform the user.
-  const handleStop = useCallback(() => {
-    // Abort any in-flight /api/chat fetch so a delayed LLM response doesn't
-    // land after the user already stopped (which would start streaming onto
-    // an already-stopped draft). runFetchThenStream's IIFE checks
-    // abortRef.current === controller and bails if it's been cleared.
-    if (abortRef.current) {
-      abortRef.current.abort();
-      abortRef.current = null;
-    }
-    if (streamTimerRef.current) {
-      clearInterval(streamTimerRef.current);
-      streamTimerRef.current = null;
-    }
-    if (streamingMessageId) {
-      // Persist the partial content to the store so it survives refresh.
-      const stoppedId = streamingMessageId;
-      setMessages((prev) => {
-        const next = prev.map((m) =>
-          m.id === stoppedId ? { ...m } : m,
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        await streamChat(
+          {
+            message: trimmed,
+            session_id: sessionIdForRequest,
+            repo_ids: repoIdsForRequest,
+            history,
+            rewrite_mode: rewriteMode,
+          },
+          {
+            onSession: (event) => {
+              const createdId = String(event.session_id);
+              // 新会话：本地消息已经完整，切换后不要再拉一次
+              skipLoadRef.current = createdId;
+              setActiveSession(createdId);
+              void loadChatSessions(true);
+            },
+            onSources: (event) => {
+              patchMessage(draftId, {
+                citations: event.sources.map((source) => ({
+                  index: source.index,
+                  chunk: toSourceChunk(source),
+                })),
+                retrieval: toRetrievalDebug(
+                  event.sources,
+                  event.retrieval,
+                  trimmed,
+                ),
+              });
+            },
+            onDelta: (event) => appendToMessage(draftId, event.text),
+            onDone: (event) => {
+              patchMessage(draftId, {
+                tokens: event.usage?.completion_tokens,
+              });
+              if (event.citation_warning) {
+                toast.warning("回答中的部分引用编号超出检索来源范围");
+              }
+            },
+            onError: (event) => toast.error(event.message || "生成失败"),
+          },
+          controller.signal,
         );
-        return next;
-      });
-      setStoppedMessages((prev) => new Set(prev).add(stoppedId));
-      // NOTE: fullReplyByDraftId entry is intentionally NOT deleted — it
-      // holds the full pre-computed reply (content + citations + retrieval)
-      // so handleResume can re-stream the remaining tokens after stop.
-      // (Only populated once streamReply has started; if stop fired during
-      // the thinking phase before streamReply ran, there's no entry —
-      // handleResume will toast "无法继续，未找到完整内容".)
-    }
-    setStreaming(false);
-    setStreamingMessageId(null);
-    toast.info("已停止生成");
-  }, [streamingMessageId, setMessages]);
-
-  // Resume a stopped assistant message: re-stream the REMAINING tokens from
-  // where the partial content left off, then on completion restore the full
-  // content + citations + retrieval + tokens from the retained fullReply.
-  //
-  // The partial content always corresponds to a token boundary (set by
-  // streamReply's throttled flush as `tokens.slice(0, idx).join("")`), so
-  // findResumeTokenIdx returns that exact idx; the remaining slice is what
-  // we re-stream with `prefix = partial` so partial flushes read
-  // `partial + tokens.slice(0, emitted).join("")` — visually appending.
-  //
-  // Edge: if the partial already covers the full content (e.g. stop fired
-  // between the last token and the terminal completion write), there's
-  // nothing to stream — we still need to restore citations/retrieval/tokens
-  // (the draft never got the terminal flush), so we do the completion write
-  // inline and toast "已无更多内容".
-  const handleResume = useCallback(
-    (messageId: string) => {
-      if (streaming || !baseSession) return;
-      const fullReply = fullReplyByDraftId.current.get(messageId);
-      if (!fullReply) {
-        toast.info("无法继续，未找到完整内容");
-        return;
-      }
-      const existing = messages.find((m) => m.id === messageId);
-      if (!existing) {
-        toast.error("未找到消息");
-        return;
-      }
-      const partial = existing.content;
-      const allTokens = splitTokens(fullReply.content);
-      const startIdx = findResumeTokenIdx(allTokens, partial);
-      // Clear the stopped badge first so the streaming cursor takes its place.
-      setStoppedMessages((prev) => {
-        const n = new Set(prev);
-        n.delete(messageId);
-        return n;
-      });
-      if (startIdx >= allTokens.length) {
-        // Partial already covers the full content but the terminal write
-        // (citations/retrieval/tokens) never happened — do it inline.
-        updateMessageLocal(messageId, {
-          content: fullReply.content,
-          citations: fullReply.citations,
-          retrieval: fullReply.retrieval,
-          tokens: fullReply.tokens,
-        });
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === messageId
-              ? { ...m, ...fullReply, content: fullReply.content }
-              : m,
-          ),
-        );
-        fullReplyByDraftId.current.delete(messageId);
-        toast.info("已无更多内容");
-        return;
-      }
-      setStreaming(true);
-      setStreamingMessageId(messageId);
-      streamReply(messageId, fullReply, { startIdx, prefix: partial });
-    },
-    [streaming, baseSession, messages, streamReply, updateMessageLocal, setMessages],
-  );
-
-  // Retry the last assistant reply: locate the last assistant message and the
-  // user message that preceded it, push the old reply into its `versions`
-  // history, then replace it with a fresh empty draft and stream a new reply.
-  const handleRetry = useCallback(() => {
-    if (streaming || !baseSession) return;
-    let lastAssistantIdx = -1;
-    let lastUserIdx = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (lastAssistantIdx === -1 && messages[i].role === "assistant") {
-        lastAssistantIdx = i;
-      } else if (lastAssistantIdx !== -1 && messages[i].role === "user") {
-        lastUserIdx = i;
-        break;
-      }
-    }
-    if (lastAssistantIdx === -1 || lastUserIdx === -1) {
-      toast.error("未找到可重新生成的回复");
-      return;
-    }
-    const userText = messages[lastUserIdx].content;
-    const oldAssistant = messages[lastAssistantIdx];
-    const draftId = `a-${Date.now()}`;
-    // Build the draft carrying the accumulated version history (old reply
-    // pushed into versions[] so MessageHistory can show prior versions).
-    const priorVersions = [
-      ...(oldAssistant.versions ?? []),
-      { ...oldAssistant, versions: undefined },
-    ];
-    const draft: ChatMessage = {
-      id: draftId,
-      role: "assistant",
-      content: "",
-      timestamp: new Date().toISOString().replace("T", " ").slice(0, 19),
-      versions: priorVersions,
-    };
-    // History for fetchReply = messages BEFORE the user message we're
-    // regenerating (so the LLM sees the same context as the original reply,
-    // not the prior assistant reply we're about to replace).
-    const historyForFetch = messages.slice(0, lastUserIdx);
-    // Replace the old assistant with the draft in the local map AND sync to
-    // store via setMessages (so version history persists across refresh).
-    setMessages((prev) => {
-      const next = [...prev];
-      next[lastAssistantIdx] = draft;
-      return next;
-    });
-    setStoppedMessages((prev) => {
-      const n = new Set(prev);
-      n.delete(oldAssistant.id);
-      return n;
-    });
-    setStreaming(true);
-    setStreamingMessageId(draftId);
-    // Carry priorVersions into the final streamed reply so streamReply's
-    // terminal setMessages ({ ...m, ...fullReply }) preserves them on the
-    // completed message — without this, the version history would be lost
-    // when streaming finishes.
-    runFetchThenStream(draftId, userText, historyForFetch, baseSession.repoId, {
-      versions: priorVersions,
-    });
-  }, [streaming, baseSession, messages, setMessages, runFetchThenStream]);
-
-  // Edit a user message: update its content (mark edited), drop all messages
-  // after it, then trigger a fresh streamed reply for the new content.
-  const handleEditSave = useCallback(
-    (messageId: string, newContent: string) => {
-      if (!baseSession || streaming) return;
-      const trimmed = newContent.trim();
-      if (!trimmed) {
-        toast.error("内容不能为空");
-        return;
-      }
-      // Find the edited message index in the current messages.
-      const editIdx = messages.findIndex((m) => m.id === messageId);
-      if (editIdx === -1) return;
-      // Build the truncated array with the edited user message updated in place.
-      // setMessages writes to the local map AND syncs to the store via
-      // setSessionMessages, so the edit persists across refresh.
-      const kept = messages.slice(0, editIdx + 1).map((m, i) =>
-        i === editIdx ? { ...m, content: trimmed, edited: true } : m,
-      );
-      setMessages(kept);
-      setEditingId(null);
-      setStoppedMessages(new Set());
-      // Kick off a fresh streamed reply for the edited content.
-      const draftId = `a-${Date.now()}`;
-      const draft: ChatMessage = {
-        id: draftId,
-        role: "assistant",
-        content: "",
-        timestamp: new Date().toISOString().replace("T", " ").slice(0, 19),
-      };
-      // History for fetchReply = messages BEFORE the edited user message
-      // (kept[editIdx] is the edited user message itself; fetchReply appends
-      // a fresh user message with the new content).
-      const historyForFetch = kept.slice(0, editIdx);
-      setMessages((prev) => [...prev, draft]);
-      setStreaming(true);
-      setStreamingMessageId(draftId);
-      runFetchThenStream(draftId, trimmed, historyForFetch, baseSession.repoId);
-    },
-    [baseSession, streaming, messages, setMessages, runFetchThenStream],
-  );
-
-  const handleClear = useCallback(() => {
-    setMessages([]);
-    setSourcePanelOpen(false);
-    setCitation(null);
-  }, [setMessages, setSourcePanelOpen, setCitation]);
-
-  const handleJumpToCode = useCallback((chunk: SourceChunk) => {
-    const targetModule = chunk.moduleId ? getModuleById(chunk.moduleId) : undefined;
-    if (!targetModule) {
-      toast.error("该切片未关联可跳转的模块");
-      return;
-    }
-    useNavStore.getState().openModule(targetModule.id, {
-      startLine: chunk.startLine,
-      endLine: chunk.endLine,
-    });
-    toast.success(`跳转 ${targetModule.name} · L${chunk.startLine}-L${chunk.endLine}`);
-  }, []);
-
-  /**
-   * Build a new mock RetrievalDebug from the given params and update the last
-   * assistant message's retrieval + citations in place.
-   */
-  const handleReRetrieve = useCallback(
-    (params: { topK: number; rerank: boolean; vectorWeight: number }) => {
-      const lastAssistantMsg = [...messages]
-        .reverse()
-        .find((m) => m.role === "assistant");
-      if (!lastAssistantMsg) {
-        toast.error("暂无可重新检索的助手回复");
-        return;
-      }
-
-      // Pick topK chunks from SOURCE_CHUNKS, cycling if topK > available.
-      const picks: SourceChunk[] = [];
-      for (let i = 0; i < params.topK; i++) {
-        picks.push(SOURCE_CHUNKS[i % SOURCE_CHUNKS.length]);
-      }
-
-      // Compute new scores with slight randomness, descending by raw score.
-      const results: RetrievalResult[] = picks.map((chunk, i) => {
-        const base = 0.86 - i * 0.035;
-        const jitter = (Math.random() - 0.5) * 0.06;
-        const score = Math.max(0.35, Math.min(0.95, base + jitter));
-        const rerankedScore = params.rerank
-          ? Math.max(0.4, Math.min(0.97, score + 0.04 + (Math.random() - 0.5) * 0.08))
-          : score;
-        return { chunk, score, rerankedScore };
-      });
-
-      const latencyMs = 200 + Math.floor(Math.random() * 251); // 200-450
-      const nextDebug: RetrievalDebug = {
-        query: lastAssistantMsg.retrieval?.query ?? "",
-        topK: params.topK,
-        reranked: params.rerank,
-        rerankModel: "bge-reranker-v2-m3",
-        latencyMs,
-        vectorWeight: params.vectorWeight,
-        keywordWeight: 1 - params.vectorWeight,
-        results,
-      };
-
-      // Derive citations capped at 3-5 from the top results.
-      const citeCount = Math.min(5, Math.max(3, Math.min(params.topK, 5)));
-      const nextCitations: Citation[] = results
-        .slice(0, citeCount)
-        .map((r, i) => ({ index: i + 1, chunk: r.chunk }));
-
-      setMessages((prev) => {
-        const next = [...prev];
-        for (let i = next.length - 1; i >= 0; i--) {
-          if (next[i].role === "assistant") {
-            next[i] = {
-              ...next[i],
-              retrieval: nextDebug,
-              citations: nextCitations,
-            };
-            break;
-          }
+      } catch (error) {
+        if (controller.signal.aborted) {
+          // 用户主动停止：保留已生成的部分内容
+        } else {
+          toast.error(error instanceof Error ? error.message : "生成失败");
+          setMessages((prev) =>
+            prev.filter(
+              (message) =>
+                message.id !== draftId || message.content.length > 0,
+            ),
+          );
         }
-        return next;
-      });
-
-      toast.success(`已重新检索 · ${latencyMs}ms`);
+      } finally {
+        abortRef.current = null;
+        setStreaming(false);
+        setStreamingMessageId(null);
+        void loadChatSessions(true);
+      }
     },
-    [messages, setMessages],
+    [
+      activeSessionId,
+      appendToMessage,
+      draftRepoId,
+      messages,
+      patchMessage,
+      rewriteMode,
+      setActiveSession,
+      streaming,
+    ],
   );
 
-  // Empty state: all sessions deleted.
-  if (!baseSession) {
-    return (
-      <div className="flex h-full flex-col">
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
-          <Sparkles className="size-8 text-brand/60" />
-          <p className="text-sm">暂无会话，点击新建开始对话</p>
-          <Button
-            size="sm"
-            className="bg-brand text-brand-foreground hover:bg-brand/90"
-            onClick={() => {
-              createSession();
-              toast.success("已创建新对话");
-            }}
-          >
-            <MessageSquareText className="size-4" />
-            新建会话
-          </Button>
-        </div>
-      </div>
-    );
-  }
+  const handleStop = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    toast.info("已停止生成");
+  }, []);
 
   return (
     <div className="flex h-full">
       {/* sidebar (desktop) */}
-      <SessionSidebar />
+      <SessionSidebar
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        loading={sessionsLoading}
+        onCreate={handleCreateSession}
+        onSelect={handleSelectSession}
+        onDelete={handleDeleteSession}
+        onRename={handleRenameSession}
+      />
 
       {/* chat column */}
       <div className="flex h-full min-w-0 flex-1 flex-col">
         {/* top bar */}
         <div className="flex items-center gap-3 border-b border-border bg-card/60 px-4 py-3 backdrop-blur-md md:px-6">
-          {/* mobile session list trigger */}
           <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
             <SheetTrigger asChild>
               <Button
@@ -1011,7 +573,14 @@ export function ChatPage() {
                 <SheetTitle>会话列表</SheetTitle>
               </SheetHeader>
               <SessionSidebar
-                className="flex w-full !border-r-0"
+                className="!flex w-full !border-r-0"
+                sessions={sessions}
+                activeSessionId={activeSessionId}
+                loading={sessionsLoading}
+                onCreate={handleCreateSession}
+                onSelect={handleSelectSession}
+                onDelete={handleDeleteSession}
+                onRename={handleRenameSession}
                 onSessionChange={() => setMobileOpen(false)}
               />
             </SheetContent>
@@ -1019,25 +588,59 @@ export function ChatPage() {
 
           <div className="flex min-w-0 items-center gap-2">
             <MessageSquareText className="size-4 shrink-0 text-brand" />
-            <h1 className="truncate text-[15px] font-semibold">{baseSession.title}</h1>
+            <h1 className="truncate text-[15px] font-semibold">
+              {activeSession?.title ?? "新对话"}
+            </h1>
           </div>
-          {repo && (
-            <span className="hidden items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1 text-[11px] sm:inline-flex">
+
+          {activeSession ? (
+            <span
+              className="hidden items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1 text-[11px] sm:inline-flex"
+              title="仓库范围在会话创建后不可更改"
+            >
               <Github className="size-3 text-muted-foreground" />
-              <span className="font-medium">{repo.name}</span>
-              <span className="text-muted-foreground">·</span>
-              <span className="text-muted-foreground">{repo.totalChunks} 切片</span>
+              <span className="max-w-[140px] truncate font-medium">{repoLabel}</span>
+              <Lock className="size-3 text-muted-foreground" />
+              <span className="text-muted-foreground">已锁定</span>
             </span>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <Github className="hidden size-3.5 text-muted-foreground sm:block" />
+              <Select
+                value={draftRepoId}
+                onValueChange={setDraftRepoId}
+                disabled={streaming || repos.length === 0}
+              >
+                <SelectTrigger
+                  className="h-8 w-[150px] rounded-md border-border bg-card text-[12px] shadow-none sm:w-[180px]"
+                  aria-label="选择仓库范围"
+                >
+                  <SelectValue placeholder="选择仓库" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">所有仓库</SelectItem>
+                  {repos.map((repo) => (
+                    <SelectItem key={repo.id} value={repo.id}>
+                      {repo.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <span className="hidden text-[11px] text-muted-foreground sm:inline">
+                首次提问后锁定
+              </span>
+            </div>
           )}
+
           <div className="ml-auto flex items-center gap-2">
-            <Button variant="ghost" size="sm" onClick={handleClear}>
-              <Trash2 className="size-4" />
-              <span className="hidden sm:inline">清空</span>
+            <Button variant="ghost" size="sm" onClick={handleCreateSession}>
+              <Plus className="size-4" />
+              <span className="hidden sm:inline">新会话</span>
             </Button>
             <Button
               variant={showDebug ? "secondary" : "ghost"}
               size="sm"
-              onClick={() => setShowDebug((v) => !v)}
+              onClick={() => setShowDebug((value) => !value)}
             >
               <Bug className="size-4" />
               <span className="hidden sm:inline">检索调试</span>
@@ -1045,14 +648,23 @@ export function ChatPage() {
           </div>
         </div>
 
-        {/* inline debug for the last assistant message (editable) */}
+        {/* LLM 未配置提示：避免用户误以为在调用真实模型 */}
+        {llmConfigured === false && (
+          <div className="flex items-start gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-[12px] text-amber-800 md:px-6">
+            <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              后端未配置大模型（LLM_BASE_URL / LLM_API_KEY / LLM_MODEL），当前无法生成回答。
+              请在 .env 中填写真实密钥并重启后端；配置状态见 <code>/api/chat/config</code>。
+            </span>
+          </div>
+        )}
+
+        {/* inline debug for the last assistant message */}
         {showDebug && lastAssistant?.retrieval && (
           <div className="border-b border-border bg-muted/30 px-4 py-3 md:px-6">
             <div className="mx-auto max-w-3xl">
               <RetrievalDebugPanel
                 debug={lastAssistant.retrieval}
-                editable
-                onReRetrieve={handleReRetrieve}
                 onSelectResult={handleJumpToCode}
               />
             </div>
@@ -1077,37 +689,31 @@ export function ChatPage() {
                 {messages.length === 0 && (
                   <div className="flex h-64 flex-col items-center justify-center gap-2 text-muted-foreground">
                     <Sparkles className="size-8 text-brand/60" />
-                    <p className="text-sm">开始向 CodeRAG 提问吧</p>
+                    <p className="text-sm">
+                      {isNewSession
+                        ? `开始向 CodeRAG 提问 · 范围：${repoLabel}`
+                        : "开始向 CodeRAG 提问吧"}
+                    </p>
+                    {isNewSession && (
+                      <p className="text-[12px] text-muted-foreground/80">
+                        仓库范围在首次提问后锁定
+                      </p>
+                    )}
                   </div>
                 )}
-                {messages.map((m, idx) => (
+                {messages.map((message, index) => (
                   <motion.div
-                    key={m.id}
+                    key={message.id}
                     initial={{ opacity: 0, y: 8 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ duration: 0.25 }}
                   >
                     <MessageItem
-                      message={m}
-                      isLast={idx === messages.length - 1}
-                      isStreaming={streamingMessageId === m.id}
-                      isStopped={stoppedMessages.has(m.id)}
-                      isEditing={editingId === m.id}
-                      canEdit={!streaming && (m.role === "user")}
-                      canRetry={!streaming && m.role === "assistant"}
-                      canResume={!streaming && m.role === "assistant"}
+                      message={message}
+                      isLast={index === messages.length - 1}
+                      isStreaming={streamingMessageId === message.id}
                       onCite={(i) => setCitation(i)}
                       onOpenSources={() => setSourcePanelOpen(true)}
-                      onRetry={m.role === "assistant" ? handleRetry : undefined}
-                      retryDisabled={streaming}
-                      onResume={
-                        m.role === "assistant"
-                          ? () => handleResume(m.id)
-                          : undefined
-                      }
-                      onStartEdit={() => setEditingId(m.id)}
-                      onCancelEdit={() => setEditingId(null)}
-                      onSaveEdit={(newContent) => handleEditSave(m.id, newContent)}
                     />
                   </motion.div>
                 ))}
@@ -1121,16 +727,16 @@ export function ChatPage() {
         {/* suggestions + input */}
         <div className="border-t border-border bg-card/60 px-4 py-3 backdrop-blur-md md:px-8">
           <div className="mx-auto max-w-3xl space-y-2.5">
-            {!streaming && lastAssistant && (
+            {!streaming && (lastAssistant || isNewSession) && (
               <div className="flex flex-wrap gap-1.5">
-                {CHAT_SUGGESTIONS.slice(0, 3).map((s) => (
+                {CHAT_SUGGESTIONS.slice(0, 3).map((suggestion) => (
                   <button
-                    key={s}
+                    key={suggestion}
                     type="button"
-                    onClick={() => setInput(s)}
+                    onClick={() => setInput(suggestion)}
                     className="rounded-full border border-border bg-card px-3 py-1 text-[12px] text-muted-foreground transition-colors hover:border-brand/40 hover:bg-brand-soft/30 hover:text-brand-soft-foreground"
                   >
-                    {s}
+                    {suggestion}
                   </button>
                 ))}
               </div>
@@ -1142,7 +748,7 @@ export function ChatPage() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    handleSend(input);
+                    void handleSend(input);
                   }
                 }}
                 placeholder="向 CodeRAG 提问，Enter 发送 / Shift+Enter 换行"
@@ -1163,7 +769,7 @@ export function ChatPage() {
               ) : (
                 <Button
                   size="icon"
-                  onClick={() => handleSend(input)}
+                  onClick={() => void handleSend(input)}
                   disabled={!input.trim()}
                   className="size-9 rounded-lg bg-brand text-brand-foreground hover:bg-brand/90"
                   aria-label="发送"
@@ -1171,6 +777,18 @@ export function ChatPage() {
                   <SendHorizontal className="size-4" />
                 </Button>
               )}
+            </div>
+            <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              {sessionsLoading && <Loader2 className="size-3 animate-spin" />}
+              <span>
+                改写方案：
+                {rewriteMode === "none"
+                  ? "不改写"
+                  : rewriteMode === "llm"
+                    ? "模型改写"
+                    : "规则改写"}
+                · 可在设置中修改
+              </span>
             </div>
           </div>
         </div>
@@ -1238,7 +856,6 @@ function MessageItem({
   }, [message.content]);
 
   if (message.role === "user") {
-    // Editing mode: render the inline MessageEditor instead of the bubble.
     if (isEditing && onSaveEdit && onCancelEdit) {
       return (
         <div className="flex justify-end">
@@ -1302,21 +919,20 @@ function MessageItem({
             {formatTimestamp(message.timestamp)}
           </span>
           {message.tokens && !isStreaming && (
-            <span className="border-l border-border pl-2">{message.tokens} tokens</span>
+            <span className="border-l border-border pl-2">
+              {message.tokens} tokens
+            </span>
           )}
           {isStreaming && (
-            <span className="border-l border-border pl-2 text-muted-foreground">生成中…</span>
+            <span className="border-l border-border pl-2 text-muted-foreground">
+              生成中…
+            </span>
           )}
         </div>
       </div>
 
       <div className={cn(isStreaming && "min-h-[2rem]")}>
         {isStreaming && !message.content ? (
-          // Thinking phase: fetchReply is pending and no content has landed
-          // yet. Show three pulsing brand-blue dots (same visual language as
-          // the standalone TypingIndicator) so the user sees the model is
-          // preparing a response. Once the first token arrives, this branch
-          // is replaced by MessageContent + the streaming cursor below.
           <div
             className="flex items-center gap-1.5 px-1 py-2"
             role="status"
@@ -1366,7 +982,11 @@ function MessageItem({
           {message.citations && message.citations.length > 0 && (
             <>
               <span>
-                来源 <span className="font-semibold text-foreground tabular-nums">{message.citations.length}</span> 条
+                来源{" "}
+                <span className="font-semibold text-foreground tabular-nums">
+                  {message.citations.length}
+                </span>{" "}
+                条
               </span>
               <Button
                 variant="ghost"

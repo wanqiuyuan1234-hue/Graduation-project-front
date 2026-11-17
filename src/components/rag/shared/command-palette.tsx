@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useNavStore } from "@/lib/rag/store";
+import { useChatSessions } from "@/lib/api/chat";
 import { useModuleSearch, useRepos } from "@/lib/api/hooks";
 import { SHORTCUTS_TOGGLE_EVENT } from "@/hooks/use-keyboard-shortcuts";
 import { Button } from "@/components/ui/button";
@@ -79,7 +80,7 @@ export function CommandPalette({
   const openModule = useNavStore((s) => s.openModule);
   const openRepo = useNavStore((s) => s.openRepo);
   const activeRepoId = useNavStore((s) => s.activeRepoId);
-  const sessions = useNavStore((s) => s.sessions);
+  const { sessions: chatSessions } = useChatSessions();
   const setActiveSession = useNavStore((s) => s.setActiveSession);
   const toggleTheme = useNavStore((s) => s.toggleTheme);
 
@@ -293,12 +294,12 @@ export function CommandPalette({
 
         {/* 会话 */}
         <CommandGroup heading="会话">
-          {sessions.length === 0 ? (
+          {chatSessions.length === 0 ? (
             <p className="px-2 py-3 text-center text-xs text-muted-foreground">
               暂无会话。在对话页面新建一个会话即可。
             </p>
           ) : (
-            sessions.map((sess) => (
+            chatSessions.map((sess) => (
               <CommandItem
                 key={sess.id}
                 value={`${sess.title} 会话 session ${sess.id}`}
@@ -310,7 +311,7 @@ export function CommandPalette({
                     {sess.title}
                   </span>
                   <span className="truncate text-[11px] text-muted-foreground">
-                    {sess.messages.length} 条消息 · {sess.createdAt}
+                    {sess.messageCount ?? 0} 条消息 · {sess.createdAt}
                   </span>
                 </div>
                 <CommandShortcut>⏎</CommandShortcut>

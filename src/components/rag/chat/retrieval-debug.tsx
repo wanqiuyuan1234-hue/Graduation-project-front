@@ -339,7 +339,7 @@ function WeightBar({
   );
 }
 
-function ChunkTypeBadge({ type }: { type: ModuleType | "block" | "import" }) {
+function ChunkTypeBadge({ type }: { type: SourceChunk["chunkType"] }) {
   if (type === "block" || type === "import") {
     return (
       <span className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-[11px] font-medium text-slate-600">

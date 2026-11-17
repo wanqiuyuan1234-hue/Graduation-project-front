@@ -3,6 +3,7 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Github,
+  Loader2,
   MessageSquareText,
   Pencil,
   Plus,
@@ -10,57 +11,25 @@ import {
   Trash2,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import { getRepoById } from "@/lib/rag/mock-data";
-import { useNavStore } from "@/lib/rag/store";
 import type { ChatSession } from "@/lib/rag/types";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { toast } from "sonner";
 
 interface SessionSidebarProps {
   className?: string;
+  sessions: ChatSession[];
+  activeSessionId: string | null;
+  loading?: boolean;
+  onCreate: () => void;
+  onSelect: (id: string) => void;
+  onDelete: (id: string) => void;
+  onRename: (id: string, title: string) => void;
   /** Optional callback fired after the active session changes (e.g. to close a mobile sheet). */
   onSessionChange?: () => void;
 }
 
-function formatLastPreview(content: string): string {
-  if (!content) return "";
-  const text = content.replace(/[#*`>\-_~\n\r]/g, " ").replace(/\s+/g, " ").trim();
-  return text.slice(0, 18);
-}
-
-// Build a ~30-char window around the first case-insensitive match of `q`
-// inside `content` (after stripping markdown noise). Returns null when `q`
-// is not found. The returned snippet is guaranteed to contain `q` so the
-// HighlightText helper can re-locate and wrap it.
-function buildSnippet(content: string, q: string): string | null {
-  const cleaned = content
-    .replace(/[#*`>\-_~\n\r]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!cleaned) return null;
-  const idx = cleaned.toLowerCase().indexOf(q);
-  if (idx < 0) return null;
-  const window = 30;
-  const half = Math.floor(window / 2);
-  let start = Math.max(0, idx - half);
-  let end = Math.min(cleaned.length, idx + q.length + half);
-  // Expand to use the full window when only one side is clipped.
-  if (end - start < Math.min(window, cleaned.length)) {
-    if (start === 0) {
-      end = Math.min(cleaned.length, start + window);
-    } else if (end === cleaned.length) {
-      start = Math.max(0, end - window);
-    }
-  }
-  const prefix = start > 0 ? "\u2026" : "";
-  const suffix = end < cleaned.length ? "\u2026" : "";
-  return prefix + cleaned.slice(start, end) + suffix;
-}
-
 // Case-insensitive highlight of the first occurrence of `q` inside `text`.
-// Preserves the original text's case in the rendered <mark>.
 function HighlightText({ text, q }: { text: string; q: string }) {
   if (!q) return <>{text}</>;
   const idx = text.toLowerCase().indexOf(q.toLowerCase());
@@ -76,73 +45,39 @@ function HighlightText({ text, q }: { text: string; q: string }) {
   );
 }
 
+/**
+ * 会话列表：数据全部来自后端 `/api/chat/sessions`，组件只负责展示与事件上抛。
+ *
+ * 搜索仅匹配标题——消息正文不在列表接口里返回，避免为了搜索把每个会话的
+ * 全文都拉到前端；需要找正文时进入会话后使用浏览器内查找。
+ */
 export function SessionSidebar({
   className,
+  sessions,
+  activeSessionId,
+  loading = false,
+  onCreate,
+  onSelect,
+  onDelete,
+  onRename,
   onSessionChange,
 }: SessionSidebarProps) {
-  const sessions = useNavStore((s) => s.sessions);
-  const activeSessionId = useNavStore((s) => s.activeSessionId);
-  const createSession = useNavStore((s) => s.createSession);
-  const deleteSession = useNavStore((s) => s.deleteSession);
-  const renameSession = useNavStore((s) => s.renameSession);
-  const setActiveSession = useNavStore((s) => s.setActiveSession);
-
   const [query, setQuery] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState("");
 
   const q = query.trim().toLowerCase();
 
-  const sortedSessions = useMemo(
+  const filtered = useMemo(
     () =>
-      [...sessions].sort((a, b) =>
-        b.createdAt.localeCompare(a.createdAt),
-      ),
-    [sessions],
+      q
+        ? sessions.filter((session) => session.title.toLowerCase().includes(q))
+        : sessions,
+    [sessions, q],
   );
 
-  const filtered = useMemo<
-    Array<{ session: ChatSession; snippet: string | null }>
-  >(() => {
-    if (!q) {
-      return sortedSessions.map((session) => ({ session, snippet: null }));
-    }
-    const out: Array<{ session: ChatSession; snippet: string | null }> = [];
-    for (const session of sortedSessions) {
-      const titleHit = session.title.toLowerCase().includes(q);
-      // Only build a message snippet when the title itself does NOT match —
-      // per spec, the snippet row replaces the default preview only for
-      // message-content matches (not title matches).
-      let snippet: string | null = null;
-      if (!titleHit) {
-        for (const m of session.messages) {
-          const s = buildSnippet(m.content, q);
-          if (s) {
-            snippet = s;
-            break;
-          }
-        }
-      }
-      if (titleHit || snippet !== null) {
-        out.push({ session, snippet });
-      }
-    }
-    return out;
-  }, [sortedSessions, q]);
-
-  function handleCreate() {
-    createSession();
-    toast.success("已创建新对话");
-    onSessionChange?.();
-  }
-
-  function handleDelete(id: string) {
-    deleteSession(id);
-    toast.success("已删除会话");
-  }
-
   function handleSelect(id: string) {
-    setActiveSession(id);
+    onSelect(id);
     onSessionChange?.();
   }
 
@@ -153,9 +88,7 @@ export function SessionSidebar({
 
   function commitRename(id: string) {
     const next = draftTitle.trim();
-    if (next) {
-      renameSession(id, next);
-    }
+    if (next) onRename(id, next);
     setEditingId(null);
     setDraftTitle("");
   }
@@ -176,11 +109,12 @@ export function SessionSidebar({
       <div className="flex h-16 items-center gap-2 border-b border-border px-4">
         <MessageSquareText className="size-4 shrink-0 text-brand" />
         <h2 className="text-[14px] font-semibold">会话</h2>
+        {loading && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
         <Button
           variant="ghost"
           size="icon"
           className="ml-auto size-7 text-muted-foreground transition-transform duration-200 hover:scale-105 hover:bg-accent hover:text-foreground"
-          onClick={handleCreate}
+          onClick={onCreate}
           aria-label="新建会话"
           title="新建会话"
         >
@@ -195,9 +129,9 @@ export function SessionSidebar({
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索会话标题或内容"
+            placeholder="搜索会话标题"
             className="h-8 rounded-md border-border bg-card pl-7 text-[12px] shadow-none focus-visible:ring-1 focus-visible:ring-brand/40"
-            aria-label="搜索会话标题或内容"
+            aria-label="搜索会话标题"
           />
         </div>
       </div>
@@ -207,15 +141,12 @@ export function SessionSidebar({
         {filtered.length === 0 ? (
           <div className="flex h-40 flex-col items-center justify-center gap-1.5 text-muted-foreground">
             <Search className="size-5 opacity-40" />
-            <p className="text-[12px]">未匹配到会话</p>
+            <p className="text-[12px]">{q ? "未匹配到会话" : "暂无会话"}</p>
           </div>
         ) : (
           <AnimatePresence initial={false}>
-            {filtered.map(({ session, snippet }) => {
+            {filtered.map((session) => {
               const isActive = session.id === activeSessionId;
-              const repo = getRepoById(session.repoId);
-              const lastMsg = session.messages[session.messages.length - 1];
-              const preview = lastMsg ? formatLastPreview(lastMsg.content) : "";
               const isEditing = editingId === session.id;
 
               return (
@@ -233,9 +164,6 @@ export function SessionSidebar({
                       : "hover:bg-accent hover:translate-x-0.5",
                   )}
                 >
-                  {/* active left accent bar — animates in (scaleY 0→1) when
-                      the row becomes active; origin-top keeps the bar anchored
-                      at the top of the row for a natural downward reveal. */}
                   <span
                     aria-hidden
                     className={cn(
@@ -272,44 +200,18 @@ export function SessionSidebar({
                         <p className="truncate text-[13px] font-medium">
                           <HighlightText text={session.title} q={q} />
                         </p>
-                        {snippet !== null ? (
-                          <>
-                            <p className="mt-1 line-clamp-1 text-[11px] text-muted-foreground">
-                              <HighlightText text={snippet} q={q} />
-                            </p>
-                            <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground/80">
-                              {repo && (
-                                <span className="inline-flex min-w-0 items-center gap-0.5">
-                                  <Github className="size-3 shrink-0" />
-                                  <span className="truncate">{repo.name}</span>
-                                </span>
-                              )}
-                              <span aria-hidden>·</span>
-                              <span className="shrink-0 tabular-nums">
-                                {session.messages.length} 条
-                              </span>
-                            </div>
-                          </>
-                        ) : (
-                          <div className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                            {repo && (
-                              <span className="inline-flex min-w-0 items-center gap-0.5">
-                                <Github className="size-3 shrink-0" />
-                                <span className="truncate">{repo.name}</span>
-                              </span>
-                            )}
-                            <span aria-hidden>·</span>
-                            <span className="shrink-0 tabular-nums">
-                              {session.messages.length} 条
+                        <div className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                          <span className="inline-flex min-w-0 items-center gap-0.5">
+                            <Github className="size-3 shrink-0" />
+                            <span className="truncate">
+                              {session.repoName ?? "所有仓库"}
                             </span>
-                            {preview && (
-                              <>
-                                <span aria-hidden>·</span>
-                                <span className="truncate">{preview}</span>
-                              </>
-                            )}
-                          </div>
-                        )}
+                          </span>
+                          <span aria-hidden>·</span>
+                          <span className="shrink-0 tabular-nums">
+                            {session.messageCount ?? session.messages.length} 条
+                          </span>
+                        </div>
                       </div>
                     )}
                   </button>
@@ -335,7 +237,7 @@ export function SessionSidebar({
                         className="size-6 text-muted-foreground hover:bg-card hover:text-rose-500"
                         onClick={(e) => {
                           e.stopPropagation();
-                          handleDelete(session.id);
+                          onDelete(session.id);
                         }}
                         aria-label="删除会话"
                         title="删除"

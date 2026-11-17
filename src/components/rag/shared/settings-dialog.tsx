@@ -12,9 +12,16 @@ import {
   Settings,
   Sun,
   Trash2,
+  Wand2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useNavStore } from "@/lib/rag/store";
+import {
+  clearAllChatSessions,
+  loadChatSessions,
+  useChatSessions,
+} from "@/lib/api/chat";
+import type { RewriteMode } from "@/lib/rag/types";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -55,6 +62,13 @@ const SPEED_LABELS: Record<number, string> = {
   4: "快",
   5: "极快",
 };
+
+/** 多轮改写的三档方案，默认 rule（与后端 CHAT_REWRITE_MODE 默认值一致）。 */
+const REWRITE_OPTIONS: { value: RewriteMode; label: string }[] = [
+  { value: "none", label: "不改写" },
+  { value: "rule", label: "规则" },
+  { value: "llm", label: "模型" },
+];
 
 /**
  * Read the current byte size of the `coderag-nav` localStorage entry, in KB
@@ -158,7 +172,9 @@ export function SettingsDialog({
   const setTheme = useNavStore((s) => s.setTheme);
   const streamSpeed = useNavStore((s) => s.streamSpeed);
   const setStreamSpeed = useNavStore((s) => s.setStreamSpeed);
-  const sessions = useNavStore((s) => s.sessions);
+  const rewriteMode = useNavStore((s) => s.rewriteMode);
+  const setRewriteMode = useNavStore((s) => s.setRewriteMode);
+  const { sessions } = useChatSessions();
 
   // LocalStorage usage in KB, computed on demand via useMemo. We deliberately
   // avoid useState + useEffect here (setState-in-effect is an anti-pattern
@@ -182,16 +198,19 @@ export function SettingsDialog({
     toast.success(`已切换为跟随系统（${prefersDark ? "深色" : "浅色"}）`);
   }, [setTheme]);
 
-  const handleClearSessions = useCallback(() => {
-    useNavStore.setState({
-      sessions: [],
-      activeSessionId: null,
-      activeCitationIndex: null,
-      sourcePanelOpen: false,
-    });
-    toast.success("已清空所有会话");
-    // `sessions` reference changes above → useMemo recomputes navKb on the
-    // next render, so the displayed size updates without manual setState.
+  const handleClearSessions = useCallback(async () => {
+    try {
+      await clearAllChatSessions();
+      useNavStore.setState({
+        activeSessionId: null,
+        activeCitationIndex: null,
+        sourcePanelOpen: false,
+      });
+      toast.success("已清空所有会话");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "清空会话失败");
+      void loadChatSessions(true);
+    }
   }, []);
 
   const handleResetDefaults = useCallback(() => {
@@ -215,7 +234,7 @@ export function SettingsDialog({
             设置
           </DialogTitle>
           <DialogDescription className="text-xs">
-            管理应用偏好与本地数据。所有设置仅保存在本浏览器中。
+            偏好设置保存在本浏览器；会话与消息保存在后端数据库。
           </DialogDescription>
         </DialogHeader>
 
@@ -320,6 +339,53 @@ export function SettingsDialog({
             </div>
           </section>
 
+          {/* 多轮改写 */}
+          <section className="space-y-1">
+            <SectionHeader icon={Wand2} title="多轮改写" />
+            <SettingsRow
+              label="提问改写方案"
+              hint="问题里出现“它 / 这个 / 上述”等指代时，如何补全检索词"
+              htmlFor="rewrite-radio"
+            >
+              <RadioGroup
+                id="rewrite-radio"
+                value={rewriteMode}
+                onValueChange={(value) =>
+                  setRewriteMode(value as RewriteMode)
+                }
+                className="grid grid-cols-3 gap-2"
+              >
+                {REWRITE_OPTIONS.map((option) => (
+                  <Label
+                    key={option.value}
+                    htmlFor={`rewrite-${option.value}`}
+                    className={cn(
+                      "flex cursor-pointer items-center justify-center gap-1.5 rounded-lg border px-2.5 py-2 text-xs transition-colors",
+                      rewriteMode === option.value
+                        ? "border-brand bg-brand-soft text-brand-soft-foreground"
+                        : "border-border hover:bg-accent",
+                    )}
+                  >
+                    <RadioGroupItem
+                      id={`rewrite-${option.value}`}
+                      value={option.value}
+                    />
+                    {option.label}
+                  </Label>
+                ))}
+              </RadioGroup>
+            </SettingsRow>
+            <p className="pb-1 text-xs text-muted-foreground">
+              {rewriteMode === "none" &&
+                "直接用原问题检索，适合每轮问题都自带完整上下文的场景。"}
+              {rewriteMode === "rule" &&
+                "仅当问题含指代词时，把上一轮的类名/方法名补进检索词（默认）。"}
+              {rewriteMode === "llm" &&
+                "用当前模型改写检索词；调用失败会自动降级为规则改写。"}
+              改写只影响检索，发给模型的仍是你的原始问题。
+            </p>
+          </section>
+
           {/* 数据管理 */}
           <section className="space-y-1">
             <SectionHeader icon={Database} title="数据管理" />
@@ -397,8 +463,8 @@ export function SettingsDialog({
                     <AlertDialogHeader>
                       <AlertDialogTitle>重置为默认数据？</AlertDialogTitle>
                       <AlertDialogDescription>
-                        将清除浏览器中的所有 CodeRAG
-                        本地数据（会话、主题、偏好设置），页面刷新后恢复为初始示例数据。此操作无法撤销。
+                        将清除浏览器中的 CodeRAG 偏好设置与主题，页面刷新后恢复默认值。
+                        服务端的会话与消息不会被删除。此操作无法撤销。
                       </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>
@@ -438,7 +504,7 @@ export function SettingsDialog({
               <div className="flex items-center justify-between">
                 <span className="text-xs text-muted-foreground">检索模型</span>
                 <span className="text-xs text-foreground">
-                  bge-m3 · bge-reranker-v2-m3
+                  bge-small-zh-v1.5 · 混合检索（无重排）
                 </span>
               </div>
               <a

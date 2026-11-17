@@ -11,7 +11,7 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import type { CodeModule, FileTreeNode, Repo } from "@/lib/rag/types";
 import { useNavStore } from "@/lib/rag/store";
-import { apiGet, apiPost } from "./client";
+import { apiDelete, apiGet, apiPost } from "./client";
 import {
   toCodeModule,
   toCodeModuleDetail,
@@ -115,6 +115,19 @@ export async function submitRepo(url: string): Promise<ApiRepoCreateResult> {
 export async function cancelJob(jobId: string): Promise<void> {
   await apiPost(`/api/jobs/${jobId}/cancel`);
   await loadRepos(true);
+}
+
+export interface DeleteRepoResult {
+  deleted: number;
+  vectors_removed: boolean;
+  dir_removed: boolean;
+}
+
+/** 删除仓库（后端会清理 PG 行、向量、任务与克隆目录），成功后刷新列表。 */
+export async function deleteRepo(repoId: string): Promise<DeleteRepoResult> {
+  const result = await apiDelete<DeleteRepoResult>(`/api/repos/${repoId}`);
+  await loadRepos(true);
+  return result;
 }
 
 /** 有任务进行中时按固定间隔轮询仓库列表（不用 SSE/WebSocket）。 */

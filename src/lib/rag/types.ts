@@ -133,17 +133,23 @@ export interface CodeModule {
 
 export interface SourceChunk {
   id: string;
+  /** 后端 chunk.id，用于引用与跳转。 */
+  chunkId?: string;
   moduleId: string;
   repoId: string;
+  repoName?: string;
+  fileId?: string;
   filePath: string;
   language: Language;
   startLine: number;
   endLine: number;
   content: string;
-  chunkType: ModuleType | "block" | "import";
+  chunkType: ModuleType | "method" | "constructor" | "fixed" | "block" | "import";
   tokenCount: number;
   score: number; // 0-1 retrieval score
   rerankedScore?: number; // 0-1 after reranking
+  /** 内容是否经过截断/成员展开。 */
+  truncated?: boolean;
 }
 
 export interface Citation {
@@ -199,10 +205,18 @@ export interface ChatMessage {
 export interface ChatSession {
   id: string;
   title: string;
+  /** 空字符串表示“所有仓库”。 */
   repoId: string;
+  repoName?: string;
   messages: ChatMessage[];
+  /** 服务端消息总数（列表页无需加载全部消息）。 */
+  messageCount?: number;
   createdAt: string;
+  updatedAt?: string;
 }
+
+/** 多轮提问改写方案，默认 rule。 */
+export type RewriteMode = "none" | "rule" | "llm";
 
 export interface FileTreeNode {
   name: string;

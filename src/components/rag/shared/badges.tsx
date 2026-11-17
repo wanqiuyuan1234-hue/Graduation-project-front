@@ -1,9 +1,22 @@
 import { cn } from "@/lib/utils";
 import { LANGUAGE_META, MODULE_TYPE_META, STATUS_META } from "./meta";
-import type { Language, ModuleType } from "@/lib/rag/types";
+import type { Language, ModuleType, SourceChunk } from "@/lib/rag/types";
 
-export function TypeBadge({ type, className }: { type: ModuleType; className?: string }) {
-  const meta = MODULE_TYPE_META[type];
+export function TypeBadge({
+  type,
+  className,
+}: {
+  // 检索来源可能是方法/构造器/fixed 切片，这里统一兜底展示
+  type: SourceChunk["chunkType"];
+  className?: string;
+}) {
+  const meta =
+    MODULE_TYPE_META[type as ModuleType] ??
+    ({
+      label: type,
+      color: "border-border bg-muted text-muted-foreground",
+      dot: "bg-muted-foreground",
+    } as (typeof MODULE_TYPE_META)[ModuleType]);
   return (
     <span
       className={cn(

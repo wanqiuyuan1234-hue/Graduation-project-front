@@ -24,6 +24,7 @@ import type { LucideIcon } from "lucide-react";
 import { SLICE_STRATEGIES } from "@/lib/rag/mock-data";
 import {
   cancelJob,
+  deleteRepo,
   submitRepo,
   useFileChunks,
   useFileTree,
@@ -50,6 +51,16 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -238,6 +249,25 @@ function RepoCard({
 }) {
   const strategyLabel = STRATEGY_LABELS[repo.sliceStrategy];
   const [busy, setBusy] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  async function handleDelete() {
+    setDeleting(true);
+    try {
+      const result = await deleteRepo(repo.id);
+      setConfirmOpen(false);
+      const notes = [
+        result.vectors_removed ? "向量已清理" : "向量清理失败（请稍后重试）",
+        result.dir_removed ? "克隆目录已删除" : "无克隆目录",
+      ];
+      toast.success(`已删除 ${repo.name}`, { description: notes.join(" · ") });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   async function handleResync() {
     if (!repo.url) {
@@ -399,7 +429,8 @@ function RepoCard({
               </DropdownMenuItem>
               <DropdownMenuItem
                 variant="destructive"
-                onClick={() => toast.error(`已删除 ${repo.name}`)}
+                disabled={repo.status === "syncing"}
+                onClick={() => setConfirmOpen(true)}
               >
                 <Trash2 className="size-4" />
                 删除
@@ -408,6 +439,31 @@ function RepoCard({
           </DropdownMenu>
         </div>
       </div>
+
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除仓库「{repo.name}」？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将同时删除该仓库的文件、切片、向量、入库任务记录与磁盘克隆目录，操作不可恢复。
+              {repo.status === "syncing" && " 该仓库有进行中的任务，请先取消后再删除。"}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleting || repo.status === "syncing"}
+              onClick={(event) => {
+                event.preventDefault();
+                void handleDelete();
+              }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleting ? "删除中…" : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
